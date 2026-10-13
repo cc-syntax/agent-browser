@@ -471,7 +471,11 @@ pub struct DaemonOptions<'a> {
     pub plugins: Option<&'a str>,
 }
 
-fn apply_daemon_env(cmd: &mut Command, session: &str, opts: &DaemonOptions) {
+fn apply_daemon_env(cmd: &mut Command, session: &str, opts: &DaemonOptions, private: bool) {
+    cmd.env(
+        "AGENT_BROWSER_PRIVATE_INPUT_SESSION",
+        if private { "1" } else { "0" },
+    );
     cmd.env("AGENT_BROWSER_DAEMON", "1")
         .env("AGENT_BROWSER_SESSION", session);
 
@@ -598,6 +602,26 @@ fn daemon_config_fingerprint(opts: &DaemonOptions) -> String {
     opts.default_timeout.hash(&mut hasher);
     opts.no_auto_dialog.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
+}
+
+/// Private startup is immutable; ordinary daemon fingerprinting is unchanged.
+fn private_daemon_config_fingerprint(opts: &DaemonOptions) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    daemon_config_fingerprint(opts).hash(&mut hasher);
+    opts.allowed_domains.hash(&mut hasher);
+    opts.hide_scrollbars.hash(&mut hasher);
+    opts.engine.unwrap_or("chrome").hash(&mut hasher);
+    env::var_os("AGENT_BROWSER_NO_XVFB").hash(&mut hasher);
+    if let Some(path) = opts.action_policy {
+        fs::canonicalize(path).ok().hash(&mut hasher);
+        fs::read(path).ok().hash(&mut hasher);
+    }
+    format!("private:{:016x}", hasher.finish())
+}
+
+fn private_daemon_config_matches(session: &str, opts: &DaemonOptions) -> bool {
+    fs::read_to_string(get_config_path(session))
+        .is_ok_and(|actual| actual.trim() == private_daemon_config_fingerprint(opts))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -790,6 +814,67 @@ fn stop_existing_daemon_for_restart(session: &str) {
 }
 
 pub fn ensure_daemon(session: &str, opts: &DaemonOptions) -> Result<DaemonResult, String> {
+    ensure_daemon_with_mode(session, opts, false)
+}
+
+pub fn ensure_daemon_with_mode(
+    session: &str,
+    opts: &DaemonOptions,
+    private: bool,
+) -> Result<DaemonResult, String> {
+    if !private {
+        return ensure_daemon_inner(session, opts, false);
+    }
+    // A requested policy must never silently become no policy.
+    if let Some(path) = opts.action_policy {
+        crate::native::policy::ActionPolicy::load(path)
+            .map_err(|_| crate::private_input::REFUSED.to_string())?;
+        fs::canonicalize(path).map_err(|_| crate::private_input::REFUSED.to_string())?;
+    }
+    let result = ensure_daemon_inner(session, opts, true)
+        .map_err(|_| crate::private_input::REFUSED.to_string())?;
+    if !result.already_running {
+        // Only the owned spawn may record its private startup configuration.
+        fs::write(
+            get_config_path(session),
+            private_daemon_config_fingerprint(opts),
+        )
+        .map_err(|_| crate::private_input::REFUSED.to_string())?;
+    }
+    // Also check concurrent-start winners before accepting any private reuse.
+    if !daemon_version_matches(session) || !private_daemon_config_matches(session, opts) {
+        return Err(crate::private_input::REFUSED.to_string());
+    }
+    PrivateConnection::verified(session)?;
+    Ok(result)
+}
+
+fn ensure_daemon_inner(
+    session: &str,
+    opts: &DaemonOptions,
+    private: bool,
+) -> Result<DaemonResult, String> {
+    if !private
+        && daemon_ready(session)
+        && get_socket_dir()
+            .join(format!("{}.private-input", session))
+            .exists()
+    {
+        return Err(crate::private_input::REQUIRED.to_string());
+    }
+    if private {
+        crate::private_input::validate_environment().map_err(str::to_string)?;
+        if daemon_ready(session) {
+            if !daemon_version_matches(session) || !private_daemon_config_matches(session, opts) {
+                return Err(crate::private_input::REFUSED.to_string());
+            }
+            PrivateConnection::verified(session)?;
+            return Ok(DaemonResult {
+                already_running: true,
+                restarted: false,
+            });
+        }
+    }
     let mut restarted = false;
 
     // Socket connectivity is the sole liveness check — no PID check — so
@@ -802,6 +887,10 @@ pub fn ensure_daemon(session: &str, opts: &DaemonOptions) -> Result<DaemonResult
     // this check is handled at request time: callers respawn via
     // ensure_daemon when the request fails with daemon_unreachable().
     if daemon_ready(session) {
+        if private {
+            // A concurrent daemon must never enter the ordinary restart path.
+            return Err(crate::private_input::REFUSED.to_string());
+        }
         // Check version: if the running daemon is from a different CLI
         // version (e.g. after an upgrade), kill it and start a fresh one.
         if !daemon_version_matches(session) {
@@ -876,7 +965,7 @@ pub fn ensure_daemon(session: &str, opts: &DaemonOptions) -> Result<DaemonResult
 
         let mut cmd = Command::new(&exe_path);
         cmd.env("AGENT_BROWSER_DAEMON", "1");
-        apply_daemon_env(&mut cmd, session, opts);
+        apply_daemon_env(&mut cmd, session, opts, private);
 
         unsafe {
             cmd.pre_exec(|| {
@@ -900,7 +989,7 @@ pub fn ensure_daemon(session: &str, opts: &DaemonOptions) -> Result<DaemonResult
 
         let mut cmd = Command::new(&exe_path);
         cmd.env("AGENT_BROWSER_DAEMON", "1");
-        apply_daemon_env(&mut cmd, session, opts);
+        apply_daemon_env(&mut cmd, session, opts, private);
 
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
         const DETACHED_PROCESS: u32 = 0x00000008;
@@ -1160,6 +1249,40 @@ pub(crate) fn read_timeout_for(cmd: &Value) -> Duration {
         op_ms = op_ms.max(cmd.get("duration").and_then(Value::as_u64).unwrap_or(0));
     }
     Duration::from_millis(op_ms.saturating_add(10_000).max(30_000))
+}
+
+/// A verified connection stays bound to the same daemon while stdin is read.
+/// Uses the ordinary internal RPC exchange, with no retry or respawn.
+pub struct PrivateConnection {
+    stream: Connection,
+}
+impl PrivateConnection {
+    pub fn verified(session: &str) -> Result<Self, String> {
+        let stream = connect(session).map_err(|_| crate::private_input::REQUIRED.to_string())?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .map_err(|_| crate::private_input::REQUIRED.to_string())?;
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .map_err(|_| crate::private_input::REQUIRED.to_string())?;
+        let mut connection = Self { stream };
+        let response = connection.send(&json!({"action": crate::private_input::STATUS_ACTION}))?;
+        if !response.success
+            || !response.data.is_some_and(|v| {
+                v.get("privateInputSession").and_then(Value::as_bool) == Some(true)
+                    && v.get("contract").and_then(Value::as_u64) == Some(1)
+            })
+        {
+            return Err(crate::private_input::REQUIRED.to_string());
+        }
+        Ok(connection)
+    }
+    pub fn send(&mut self, cmd: &Value) -> Result<Response, String> {
+        let mut request =
+            serde_json::to_vec(cmd).map_err(|_| crate::private_input::FAILED.to_string())?;
+        request.push(b'\n');
+        exchange(&mut self.stream, &request).map_err(|_| crate::private_input::FAILED.to_string())
+    }
 }
 
 fn send_command_once(cmd: &Value, session: &str) -> Result<Response, SendError> {

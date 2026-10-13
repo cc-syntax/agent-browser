@@ -143,6 +143,30 @@ pub async fn fill(
     )
     .await?;
 
+    // Private stdin uses this exact ordinary fill resolution and input path.
+    // Refuse a non-password target before mutation; never substitute a vault
+    // credential or expose the target's existing protected value.
+    if crate::private_input::daemon_mode() {
+        let result: Value = client.send_command_typed(
+            "Runtime.callFunctionOn",
+            &CallFunctionOnParams {
+                function_declaration: "function() { return this.tagName === 'INPUT' && this.type === 'password' && !this.disabled && !this.readOnly; }".to_string(),
+                object_id: Some(object_id.clone()),
+                arguments: None,
+                return_by_value: Some(true),
+                await_promise: Some(false),
+            }, Some(&effective_session_id),
+        ).await?;
+        if result
+            .get("result")
+            .and_then(|r| r.get("value"))
+            .and_then(Value::as_bool)
+            != Some(true)
+        {
+            return Err(crate::private_input::REFUSED.to_string());
+        }
+    }
+
     // Focus the element
     client
         .send_command_typed::<_, Value>(

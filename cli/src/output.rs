@@ -1779,6 +1779,18 @@ Examples:
 agent-browser fill - Clear and fill an input field
 
 Usage: agent-browser fill <selector> <text>
+       agent-browser --private-input-session fill <selector> --stdin
+
+Private stdin requires a verified fresh owned local Chrome private session.
+It fills only ordinary enabled password inputs, reads exact UTF-8 (no trimming),
+and never automatically retries. Positional values, private batches and MCP private
+stdio are unsupported. Ordinary nonprivate eval --stdin remains supported.
+Private reuse requires matching daemon version and startup restrictions/policy;
+mismatches refuse before stdin without restart. --debug incompatibility reports
+a fixed reason, with success:false/error when JSON output is selected.
+Private sessions disable tool-owned streams, capture and persistence; unsupported
+observation, recording, plugin, attach, profile and launch configurations are refused.
+The receiving page still receives the value and controls its own network effects.
 
 Clears the input field and fills it with the specified text.
 This replaces any existing content in the field.
@@ -4051,6 +4063,9 @@ Options:
   --screenshot-dir <path>    Default screenshot output directory (or AGENT_BROWSER_SCREENSHOT_DIR)
   --screenshot-quality <n>   JPEG quality 0-100; ignored for PNG (or AGENT_BROWSER_SCREENSHOT_QUALITY)
   --screenshot-format <fmt>  Screenshot format: png, jpeg (or AGENT_BROWSER_SCREENSHOT_FORMAT)
+  --private-input-session   Fresh owned Chrome private session; immutable until close
+                             fill <selector> --stdin reads exact UTF-8 after verification
+                             No batch/MCP, streams, recordings, raw extraction or persistence
   --input-mode <mode>        Session pointer movement: instant (default), smooth, human
   --headed                   Show browser window (not headless) (or AGENT_BROWSER_HEADED env)
   --webgpu                   Enable WebGPU; uses SwiftShader software Vulkan on Linux, no GPU required (or AGENT_BROWSER_WEBGPU env)

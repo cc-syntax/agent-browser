@@ -520,6 +520,21 @@ impl BrowserManager {
 
     pub async fn launch(options: LaunchOptions, engine: Option<&str>) -> Result<Self, String> {
         let engine = engine.unwrap_or("chrome");
+        if crate::private_input::daemon_mode() {
+            crate::private_input::validate_environment().map_err(str::to_string)?;
+            if engine != "chrome"
+                || options.profile.is_some()
+                || options.storage_state.is_some()
+                || options.executable_path.is_some()
+                || options.extensions.as_ref().is_some_and(|v| !v.is_empty())
+                || !options.args.is_empty()
+                || options.proxy.is_some()
+                || options.allow_file_access
+                || !options.headless
+            {
+                return Err(crate::private_input::REFUSED.to_string());
+            }
+        }
 
         match engine {
             "chrome" => {
@@ -595,6 +610,43 @@ impl BrowserManager {
             initialize_obscura_manager(ws_url, process).await?
         } else {
             let client = Arc::new(CdpClient::connect(&ws_url).await?);
+            if crate::private_input::daemon_mode() {
+                // Fresh owned Chrome only. All browsing takes place in a new
+                // off-the-record context, not the on-disk bootstrap profile.
+                let targets: GetTargetsResult = client
+                    .send_command_typed("Target.getTargets", &json!({}), None)
+                    .await?;
+                let context = client
+                    .send_command(
+                        "Target.createBrowserContext",
+                        Some(json!({"disposeOnDetach": true})),
+                        None,
+                    )
+                    .await?;
+                let context_id = context
+                    .get("browserContextId")
+                    .and_then(Value::as_str)
+                    .ok_or(crate::private_input::REFUSED)?;
+                client
+                    .send_command(
+                        "Target.createTarget",
+                        Some(json!({"url": "about:blank", "browserContextId": context_id})),
+                        None,
+                    )
+                    .await?;
+                // Keep the new private page alive before closing bootstrap tabs.
+                for target in targets.target_infos {
+                    if target.target_type == "page" {
+                        client
+                            .send_command(
+                                "Target.closeTarget",
+                                Some(json!({"targetId": target.target_id})),
+                                None,
+                            )
+                            .await?;
+                    }
+                }
+            }
             let mut manager = Self {
                 client,
                 browser_process: Some(process),
@@ -917,10 +969,12 @@ impl BrowserManager {
         self.client
             .send_command_no_params("Network.enable", Some(session_id))
             .await?;
-        let _ = self
-            .client
-            .send_command_no_params("WebMCP.enable", Some(session_id))
-            .await;
+        if !crate::private_input::daemon_mode() {
+            let _ = self
+                .client
+                .send_command_no_params("WebMCP.enable", Some(session_id))
+                .await;
+        }
         // Enable auto-attach for cross-origin iframe support.
         // flatten: true gives each iframe its own session_id.
         // waitForDebuggerOnStart keeps child targets paused until the daemon
@@ -4283,13 +4337,15 @@ mod tests {
 
         // Keep sending requests so idle is never reached
         tokio::spawn(async move {
-            for i in 0u64.. {
+            let mut i = 0u64;
+            loop {
                 let _ = tx.send(cdp_event(
                     "Network.requestWillBeSent",
                     session,
                     json!({ "requestId": format!("r{}", i) }),
                 ));
                 sleep(Duration::from_millis(100)).await;
+                i += 1;
             }
         });
 

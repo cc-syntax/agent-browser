@@ -20,6 +20,9 @@ pub enum PolicyResult {
 pub struct ActionPolicy {
     #[serde(skip)]
     path: PathBuf,
+    /// Memory-only identity of the file actually loaded; absent is not verified.
+    #[serde(skip)]
+    loaded_source: Option<(PathBuf, String)>,
     #[serde(default)]
     default: Option<String>,
     #[serde(default)]
@@ -63,11 +66,17 @@ impl ActionPolicy {
     /// Load policy from a JSON file at the given path.
     pub fn load(path: &str) -> Result<Self, String> {
         let path_buf = PathBuf::from(path);
-        let contents = fs::read_to_string(&path_buf)
+        let canonical_path = fs::canonicalize(&path_buf)
+            .map_err(|e| format!("Failed to resolve policy file: {}", e))?;
+        let contents = fs::read_to_string(&canonical_path)
             .map_err(|e| format!("Failed to read policy file: {}", e))?;
         let mut policy: ActionPolicy =
             serde_json::from_str(&contents).map_err(|e| format!("Invalid policy JSON: {}", e))?;
+        if fs::canonicalize(&path_buf).ok().as_ref() != Some(&canonical_path) {
+            return Err("Policy file changed while loading".to_string());
+        }
         policy.path = path_buf;
+        policy.loaded_source = Some((canonical_path, contents));
         Ok(policy)
     }
 
@@ -118,6 +127,23 @@ impl ActionPolicy {
         }
 
         PolicyResult::Allow
+    }
+
+    /// Private sessions refuse any source change instead of reloading permissions.
+    pub fn verify_unchanged(&self) -> Result<(), &'static str> {
+        let (loaded_path, loaded_contents) = self
+            .loaded_source
+            .as_ref()
+            .ok_or(crate::private_input::REFUSED)?;
+        let current_path =
+            fs::canonicalize(&self.path).map_err(|_| crate::private_input::REFUSED)?;
+        if &current_path != loaded_path
+            || fs::read_to_string(&current_path).ok().as_ref() != Some(loaded_contents)
+            || fs::canonicalize(&self.path).ok().as_ref() != Some(loaded_path)
+        {
+            return Err(crate::private_input::REFUSED);
+        }
+        Ok(())
     }
 
     /// Reload policy from the file. Re-reads the JSON and updates the policy.

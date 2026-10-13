@@ -3894,6 +3894,24 @@ fn append_common_global_args(
 }
 
 fn run_cli(args: &[String], stdin_body: Option<String>, timeout_ms: u64) -> Result<CliRun, String> {
+    // MCP owns protocol stdin. Reject semantic private flags/fill in nested
+    // batches before child launch; ordinary eval stdin remains supported.
+    if crate::private_input::contains_private_args(args)
+        || (crate::flags::clean_args(args).first().map(String::as_str) == Some("batch")
+            && stdin_body
+                .as_ref()
+                .is_some_and(|body| crate::private_input::contains_private_batch(body)))
+    {
+        return Err(crate::private_input::MCP_UNSUPPORTED.to_string());
+    }
+    if crate::private_input::daemon_mode()
+        || crate::flags::load_config(args)
+            .map_err(|_| crate::private_input::MCP_UNSUPPORTED.to_string())?
+            .private_input_session
+            == Some(true)
+    {
+        return Err(crate::private_input::MCP_UNSUPPORTED.to_string());
+    }
     let exe = env::current_exe().map_err(|e| e.to_string())?;
     let mut command = Command::new(exe);
     command

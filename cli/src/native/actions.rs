@@ -539,6 +539,7 @@ impl SessionSetup {
 }
 
 pub struct DaemonState {
+    pub(crate) private_input: crate::private_input::PrivateInput,
     pub browser: Option<BrowserManager>,
     pub appium: Option<AppiumManager>,
     pub safari_driver: Option<safari::SafariDriverProcess>,
@@ -684,11 +685,15 @@ impl DaemonState {
         let pin_tab = matches!(
             env::var("AGENT_BROWSER_PIN_TAB").as_deref(),
             Ok("1" | "true" | "yes")
-        ) || tab_binding::load(&session_id)
-            .ok()
-            .flatten()
-            .is_some_and(|b| b.pinned);
+        ) || (!crate::private_input::daemon_mode()
+            && tab_binding::load(&session_id)
+                .ok()
+                .flatten()
+                .is_some_and(|b| b.pinned));
         Self {
+            private_input: crate::private_input::PrivateInput::new(
+                crate::private_input::daemon_mode(),
+            ),
             browser: None,
             appium: None,
             safari_driver: None,
@@ -1847,7 +1852,7 @@ impl DaemonState {
                                 self.webmcp.clear_frame_scope(session_id, frame_id);
                             }
                         }
-                        "Runtime.consoleAPICalled" => {
+                        "Runtime.consoleAPICalled" if !self.private_input.enabled() => {
                             let level = event
                                 .params
                                 .get("type")
@@ -1865,7 +1870,7 @@ impl DaemonState {
                             }
                             self.event_tracker.add_console(level, &text, raw_args);
                         }
-                        "Runtime.exceptionThrown" => {
+                        "Runtime.exceptionThrown" if !self.private_input.enabled() => {
                             if let Ok(ex_event) =
                                 serde_json::from_value::<ExceptionThrownEvent>(event.params.clone())
                             {
@@ -2576,7 +2581,8 @@ fn skip_launch_action(action: &str) -> bool {
 
     matches!(
         action,
-        "" | "launch"
+        "" | crate::private_input::STATUS_ACTION
+            | "launch"
             | "close"
             | "read"
             | "har_stop"
@@ -2659,6 +2665,49 @@ fn policy_actions_for_command(
 }
 
 pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
+    if let Err(reason) = state.private_input.guard(cmd) {
+        return crate::private_input::refusal(reason);
+    }
+    if state.private_input.enabled() {
+        if let Some(policy) = &state.policy {
+            if let Err(reason) = policy.verify_unchanged() {
+                return crate::private_input::refusal(reason);
+            }
+        } else if env::var_os("AGENT_BROWSER_ACTION_POLICY").is_some()
+            || env::var_os("AGENT_BROWSER_POLICY").is_some()
+        {
+            // A configured policy that failed to load is never "no policy".
+            return crate::private_input::refusal(crate::private_input::REFUSED);
+        }
+    }
+    state.private_input.remember(cmd);
+    let mut response = execute_command_inner(cmd, state).await;
+    if state.private_input.enabled() {
+        if cmd.get("privateInput").and_then(Value::as_bool) == Some(true) {
+            response = if response.get("success").and_then(Value::as_bool) == Some(true) {
+                json!({"success": true, "data": {"filled": true}})
+            } else {
+                crate::private_input::refusal(
+                    if response.get("error").and_then(Value::as_str)
+                        == Some(crate::private_input::CONFIRMATION)
+                    {
+                        crate::private_input::CONFIRMATION
+                    } else {
+                        crate::private_input::FAILED
+                    },
+                )
+            };
+        } else {
+            state.private_input.redact_response(
+                &mut response,
+                cmd.get("action").and_then(Value::as_str).unwrap_or(""),
+            );
+        }
+    }
+    response
+}
+
+async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
     let action = cmd.get("action").and_then(|v| v.as_str()).unwrap_or("");
     // Unlike normal auth login, no-navigation mode must never launch a
     // browser or manufacture an about:blank page to satisfy the command.
@@ -2810,9 +2859,15 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
     let mut lifecycle_relaunched_browser = false;
     let policy_actions = policy_actions_for_command(cmd, action, needs_launch);
 
-    // Hot-reload and check action policy
+    // Reverify after async setup; ordinary sessions retain hot-reload behavior.
     if let Some(ref mut policy) = state.policy {
-        let _ = policy.reload();
+        if state.private_input.enabled() {
+            if let Err(reason) = policy.verify_unchanged() {
+                return error_response(&id, reason);
+            }
+        } else {
+            let _ = policy.reload();
+        }
         let mut confirmation_required: Option<String> = None;
         for policy_action in &policy_actions {
             match policy.check(policy_action) {
@@ -2833,6 +2888,9 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
             }
         }
         if let Some(policy_action) = confirmation_required {
+            if cmd.get("privateInput").and_then(Value::as_bool) == Some(true) {
+                return error_response(&id, crate::private_input::CONFIRMATION);
+            }
             state.pending_confirmation = Some(PendingConfirmation {
                 action: policy_action.clone(),
                 cmd: cmd.clone(),
@@ -2858,6 +2916,9 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
                     continue;
                 }
                 if ca.requires_confirmation(policy_action) {
+                    if cmd.get("privateInput").and_then(Value::as_bool) == Some(true) {
+                        return error_response(&id, crate::private_input::CONFIRMATION);
+                    }
                     state.pending_confirmation = Some(PendingConfirmation {
                         action: policy_action.to_string(),
                         cmd: cmd.clone(),
@@ -2984,6 +3045,9 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
     }
 
     let result = match action {
+        crate::private_input::STATUS_ACTION => Ok(
+            json!({"contract": 1, "privateInputSession": state.private_input.enabled(), "disabled": ["stream", "history", "console", "errors", "rawCDP", "trace", "profiler", "HAR", "video", "screencast", "autosave"]}),
+        ),
         "launch" => {
             let webmcp_enabled = cmd
                 .get("webmcp")
@@ -3292,6 +3356,9 @@ fn auto_launch_error_context(has_cdp: bool) -> &'static str {
 /// would let a daemon restart drop the binding and, for a pinned session,
 /// the strict isolation boundary with it).
 fn maybe_persist_tab_binding(state: &mut DaemonState) -> Option<String> {
+    if state.private_input.enabled() {
+        return None;
+    }
     let mgr = state.browser.as_ref()?;
     let (target_id, url) = mgr.binding_snapshot()?;
     let binding = tab_binding::TabBinding {
@@ -4501,10 +4568,11 @@ fn launch_options_from_env() -> LaunchOptions {
         viewport_size: None,
         use_real_keychain: false,
         webgpu: webgpu_from_env(),
-        webmcp: !matches!(
-            env::var("AGENT_BROWSER_NO_WEBMCP").as_deref(),
-            Ok("1" | "true" | "yes")
-        ),
+        webmcp: !crate::private_input::daemon_mode()
+            && !matches!(
+                env::var("AGENT_BROWSER_NO_WEBMCP").as_deref(),
+                Ok("1" | "true" | "yes")
+            ),
         no_xvfb: no_xvfb_from_env(),
         restrict_webrtc: env::var("AGENT_BROWSER_ALLOWED_DOMAINS")
             .is_ok_and(|domains| !domains.trim().is_empty()),
@@ -4701,7 +4769,7 @@ fn autosave_due(state: &DaemonState, interval_ms: u64) -> bool {
 /// page is mid-navigation; the next interval retries, and
 /// `auto_save_restore_state` records the status either way.
 pub(crate) async fn maybe_autosave_restore_state(state: &mut DaemonState, interval_ms: u64) {
-    if !autosave_due(state, interval_ms) {
+    if state.private_input.enabled() || !autosave_due(state, interval_ms) {
         return;
     }
     // Sessions without a restore key, or with saving disabled, never autosave.
@@ -4719,6 +4787,9 @@ pub(crate) async fn maybe_autosave_restore_state(state: &mut DaemonState, interv
 pub(crate) async fn auto_save_restore_state(
     state: &mut DaemonState,
 ) -> Result<Option<String>, String> {
+    if state.private_input.enabled() {
+        return Ok(None);
+    }
     validate_restore_if_pending(state).await;
 
     let Some(session_name) = state.session_name.clone() else {
