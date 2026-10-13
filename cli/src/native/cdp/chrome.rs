@@ -479,6 +479,19 @@ fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
         "--metrics-recording-only".to_string(),
     ];
 
+    if crate::private_input::daemon_mode() {
+        crate::private_input::validate_environment().map_err(str::to_string)?;
+        args.extend(
+            [
+                "--incognito",
+                "--disable-extensions",
+                "--disable-breakpad",
+                "--disable-crash-reporter",
+            ]
+            .map(str::to_string),
+        );
+    }
+
     if options.webgpu {
         // WebGPU is not exposed in headless or GPU-blocklisted environments
         // unless explicitly enabled.

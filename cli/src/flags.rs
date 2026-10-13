@@ -51,9 +51,11 @@ fn parse_idle_timeout_value(value: Option<String>, source: &str) -> Option<Strin
     })
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, serde::Serialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Config {
+    /// Opt into an immutable owned private-input session.
+    pub private_input_session: Option<bool>,
     pub headed: Option<bool>,
     pub json: Option<bool>,
     pub debug: Option<bool>,
@@ -120,6 +122,7 @@ impl Config {
             }
         };
         Config {
+            private_input_session: other.private_input_session.or(self.private_input_session),
             headed: other.headed.or(self.headed),
             json: other.json.or(self.json),
             debug: other.debug.or(self.debug),
@@ -200,9 +203,14 @@ impl Config {
     }
 }
 
+#[cfg(test)]
 fn read_config_file(path: &Path) -> Option<Config> {
     let content = fs::read_to_string(path).ok()?;
-    match serde_json::from_str::<Config>(&content) {
+    parse_config_file(path, &content)
+}
+
+fn parse_config_file(path: &Path, content: &str) -> Option<Config> {
+    match serde_json::from_str::<Config>(content) {
         Ok(mut config) => {
             config.idle_timeout = parse_idle_timeout_value(
                 config.idle_timeout.take(),
@@ -340,30 +348,86 @@ pub fn load_config(args: &[String]) -> Result<Config, String> {
                 .map(|p| ("AGENT_BROWSER_CONFIG", Some(p)))
         });
 
-    if let Some((source, maybe_path)) = explicit {
+    let explicit_path = if let Some((source, maybe_path)) = explicit {
         let path_str = maybe_path.ok_or_else(|| format!("{} requires a file path", source))?;
         let path = PathBuf::from(&path_str);
         if !path.exists() {
             return Err(format!("config file not found: {}", path_str));
         }
-        return read_config_file(&path)
-            .ok_or_else(|| format!("failed to load config from {}", path_str));
+        Some(path)
+    } else {
+        None
+    };
+    let paths = if let Some(path) = &explicit_path {
+        vec![path.clone()]
+    } else {
+        let mut paths = Vec::new();
+        if let Some(home) = dirs::home_dir() {
+            paths.push(home.join(CONFIG_DIR).join(CONFIG_FILENAME));
+        }
+        paths.push(PathBuf::from(PROJECT_CONFIG_FILENAME));
+        paths
+    };
+    // Read once, then resolve output precedence across every selected raw file
+    // before emitting a fixed private validation failure or parser diagnostics.
+    let sources: Vec<_> = paths
+        .into_iter()
+        .filter_map(|path| {
+            fs::read_to_string(&path)
+                .ok()
+                .map(|content| (path, content))
+        })
+        .collect();
+    let raw: Vec<serde_json::Value> = sources
+        .iter()
+        .map(|(_, content)| serde_json::from_str(content).unwrap_or(serde_json::Value::Null))
+        .collect();
+    let private_requested = clean_args_with_private_flag(args).1
+        || crate::private_input::daemon_mode()
+        || raw.iter().any(|value| {
+            value
+                .get("privateInputSession")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+        });
+    if private_requested {
+        let config_json = raw
+            .iter()
+            .filter_map(|value| value.get("json").and_then(serde_json::Value::as_bool))
+            .next_back();
+        let json = private_error_json(args, config_json);
+        for value in &raw {
+            if let Err(reason) = crate::private_input::validate_config(value) {
+                crate::private_input::exit_error(reason, json);
+            }
+            if serde_json::from_value::<Config>(value.clone()).is_err() {
+                crate::private_input::exit_error(crate::private_input::REFUSED, json);
+            }
+        }
+        if explicit_path.is_some() && sources.is_empty() {
+            crate::private_input::exit_error(crate::private_input::REFUSED, json);
+        }
     }
-
-    let user_config = dirs::home_dir()
-        .map(|d| d.join(CONFIG_DIR).join(CONFIG_FILENAME))
-        .and_then(|p| read_config_file(&p))
-        .unwrap_or_default();
-
-    let project_config = read_config_file(&PathBuf::from(PROJECT_CONFIG_FILENAME));
-
-    Ok(match project_config {
-        Some(project) => user_config.merge(project),
-        None => user_config,
-    })
+    let mut config = Config::default();
+    for (path, content) in sources {
+        match parse_config_file(&path, &content) {
+            Some(parsed) => config = config.merge(parsed),
+            None if explicit_path.is_some() => {
+                return Err(format!("failed to load config from {}", path.display()));
+            }
+            None => {}
+        }
+    }
+    if let Some(path) = explicit_path {
+        if raw.is_empty() {
+            return Err(format!("failed to load config from {}", path.display()));
+        }
+    }
+    Ok(config)
 }
 
 pub struct Flags {
+    pub private_input_session: bool,
     pub json: bool,
     pub headed: bool,
     pub debug: bool,
@@ -456,11 +520,36 @@ pub struct Flags {
     pub cli_input_mode: bool,
 }
 
+/// Match the normal JSON environment/config/CLI precedence for early safe refusals.
+fn private_error_json(args: &[String], config_json: Option<bool>) -> bool {
+    clean_args_with_modes(args)
+        .2
+        .unwrap_or_else(|| env_var_is_truthy("AGENT_BROWSER_JSON") || config_json.unwrap_or(false))
+}
+
 pub fn parse_flags(args: &[String]) -> Flags {
     let config = load_config(args).unwrap_or_else(|e| {
+        if clean_args_with_private_flag(args).1 || crate::private_input::daemon_mode() {
+            crate::private_input::exit_error(
+                crate::private_input::REFUSED,
+                private_error_json(args, None),
+            );
+        }
         eprintln!("{} {}", color::warning_indicator(), e);
         std::process::exit(1);
     });
+
+    let private_input_session =
+        clean_args_with_private_flag(args).1 || config.private_input_session == Some(true);
+    if private_input_session {
+        if let Err(reason) = crate::private_input::validate_cli_args(args).and_then(|_| {
+            crate::private_input::validate_config(
+                &serde_json::to_value(&config).unwrap_or_default(),
+            )
+        }) {
+            crate::private_input::exit_error(reason, private_error_json(args, config.json));
+        }
+    }
 
     let extensions_env = env::var("AGENT_BROWSER_EXTENSIONS")
         .ok()
@@ -535,6 +624,7 @@ pub fn parse_flags(args: &[String]) -> Flags {
     );
 
     let mut flags = Flags {
+        private_input_session,
         json: env_var_is_truthy("AGENT_BROWSER_JSON") || config.json.unwrap_or(false),
         headed: env_var_is_truthy("AGENT_BROWSER_HEADED") || config.headed.unwrap_or(false),
         debug: env_var_is_truthy("AGENT_BROWSER_DEBUG") || config.debug.unwrap_or(false),
@@ -741,6 +831,7 @@ pub fn parse_flags(args: &[String]) -> Flags {
                     i += 1;
                 }
             }
+            "--private-input-session" => {}
             "--debug" => {
                 let (val, consumed) = parse_bool_arg(args, i);
                 flags.debug = val;
@@ -1152,11 +1243,24 @@ fn looks_like_command(value: &str) -> bool {
 }
 
 pub fn clean_args(args: &[String]) -> Vec<String> {
+    clean_args_with_private_flag(args).0
+}
+
+/// Identify the actual global flag, not text inside scripts or option values.
+pub fn clean_args_with_private_flag(args: &[String]) -> (Vec<String>, bool) {
+    let (clean, private, _) = clean_args_with_modes(args);
+    (clean, private)
+}
+
+fn clean_args_with_modes(args: &[String]) -> (Vec<String>, bool, Option<bool>) {
+    let mut private = false;
+    let mut json = None;
     let mut result = Vec::new();
     let mut skip_next = false;
 
     // Boolean flags that optionally take true/false
     const GLOBAL_BOOL_FLAGS: &[&str] = &[
+        "--private-input-session",
         "--json",
         "--headed",
         "--webgpu",
@@ -1254,6 +1358,10 @@ pub fn clean_args(args: &[String]) -> Vec<String> {
             continue;
         }
         if GLOBAL_BOOL_FLAGS.contains(&arg.as_str()) {
+            private |= arg == "--private-input-session";
+            if arg == "--json" {
+                json = Some(args.get(i + 1).map(String::as_str) != Some("false"));
+            }
             if let Some(v) = args.get(i + 1) {
                 if matches!(v.as_str(), "true" | "false") {
                     i += 1;
@@ -1268,7 +1376,7 @@ pub fn clean_args(args: &[String]) -> Vec<String> {
         result.push(arg.clone());
         i += 1;
     }
-    result
+    (result, private, json)
 }
 
 #[cfg(test)]

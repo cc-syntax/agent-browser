@@ -2,6 +2,26 @@
 
 Complete reference for all agent-browser commands. For quick start and common patterns, see SKILL.md.
 
+## Private password input
+
+Use `--private-input-session` from the first command with a fresh session name. The mode is immutable for the daemon lifetime; an existing ordinary or older daemon is refused, not upgraded. Configuration may opt in with `privateInputSession: true`. Reuse requires the same daemon version and verified startup options, including allowed domains, action policy and confirmations; mismatches are refused before private stdin without restart or reconfiguration. Relative action-policy paths are resolved from the invocation directory, and changed policy content requires a fresh session.
+
+```bash
+agent-browser --session private-login --private-input-session open https://example.com/login
+# The caller supplies the private value through stdin, never argv or environment.
+agent-browser --session private-login --private-input-session fill 'input[type=password]' --stdin
+agent-browser --session private-login --private-input-session click 'button[type=submit]'
+agent-browser --session private-login --private-input-session close
+```
+
+This single-fill route reads exact UTF-8 until EOF, preserving whitespace and newlines, only after the real daemon advertises private contract version 1 on the same connection used for fill. It uses ordinary native selector resolution and fill, restricted to enabled, writable password inputs. Mixed positional values, batches, nested private flags and MCP private stdio are intentionally unsupported. MCP owns its protocol stdin and rejects semantic private-session flags and private fill, including `extraArgs` and nested batch command arrays, before child launch. Ordinary nonprivate `eval --stdin` remains supported by both CLI and MCP; flag-like text inside scripts or values is not a private request. Transport uncertainty is a fixed safe failure, never a resend or respawn.
+
+Private sessions use fresh owned local Chrome with an off-the-record context and temporary bootstrap profile. Tool-owned stream/history, console/error capture, raw CDP broadcasts, trace/profiler/HAR/video/screencast and autosave are disabled from creation. Incompatible observer, plugin, extension, init-script, custom executable/launch arguments, remote provider/attach/CDP/WebDriver/alternate engine, debug, proxy, profile, restoration, download and state-saving configurations are refused rather than silently ignored. Unknown agent-browser environment settings fail closed. Ordinary sessions are unchanged.
+
+Supported private-session operations are URL navigation, back/forward/reload, click/double-click/hover/focus/clear/check/uncheck, key press, scroll/select, dialogs, URL/title/text observations, visible/enabled/checked observations and close. Snapshot, script/raw extraction, input-value/attribute reads, screenshots, tabs, recordings and state exports are unsupported. Protected input values are not exposed by these observations; known raw supplied values are redacted from permitted textual responses for the remaining session using memory-only retention. Private fill returns only fixed success/error output. Existing deny and action-policy checks remain enforced; a private fill requiring confirmation is refused before any pending command is retained, without automatic approval.
+
+The receiving page necessarily receives the field data. This boundary covers browser-tool generated logs, outputs, observers and retention, not deliberately encoded page transformations, page-side network/business effects, OS memory inspection or arbitrary receiving-page behavior. Close the session when finished. Do not use this source feature for real credentials until independent privacy acceptance, review and operator-controlled activation are complete.
+
 ## Navigation
 
 ```bash

@@ -257,6 +257,8 @@ impl CdpClient {
 
         let private_sessions: PrivateSessions = Arc::new(std::sync::Mutex::new(HashMap::new()));
 
+        // Immutable from process creation, before any observer can subscribe.
+        let private_input = crate::private_input::daemon_mode();
         let pending_clone = pending.clone();
         let event_tx_clone = event_tx.clone();
         let raw_tx_clone = raw_tx.clone();
@@ -300,7 +302,7 @@ impl CdpClient {
 
                 // Broadcast raw message for inspect proxy subscribers before typed parse,
                 // so messages with negative IDs (used by the inspect proxy) are still delivered.
-                if raw_tx_clone.receiver_count() > 0 {
+                if !private_input && raw_tx_clone.receiver_count() > 0 {
                     let session_id = serde_json::from_str::<serde_json::Value>(&msg)
                         .ok()
                         .and_then(|v| v.get("sessionId")?.as_str().map(String::from));
@@ -351,12 +353,39 @@ impl CdpClient {
                         let _ = tx.send(parsed);
                     }
                 } else if let Some(ref method) = parsed.method {
-                    // Event
-                    let event = CdpEvent {
+                    // Only lifecycle/control events needed for ordinary operation.
+                    // Console, exceptions, network history and custom observers
+                    // never enter a broadcast queue in a private session.
+                    if private_input
+                        && !matches!(
+                            method.as_str(),
+                            "Target.attachedToTarget"
+                                | "Target.detachedFromTarget"
+                                | "Target.targetCreated"
+                                | "Target.targetDestroyed"
+                                | "Target.targetInfoChanged"
+                                | "Page.frameAttached"
+                                | "Page.frameDetached"
+                                | "Page.frameNavigated"
+                                | "Page.loadEventFired"
+                                | "Page.domContentEventFired"
+                                | "Page.javascriptDialogOpening"
+                                | "Page.javascriptDialogClosed"
+                                | "Fetch.requestPaused"
+                                | "Fetch.authRequired"
+                        )
+                    {
+                        continue;
+                    }
+                    let mut event = CdpEvent {
                         method: method.clone(),
                         params: parsed.params.clone().unwrap_or(Value::Null),
                         session_id: parsed.session_id.clone(),
                     };
+                    if private_input && method == "Page.javascriptDialogOpening" {
+                        event.params["message"] = Value::String("[private]".to_string());
+                        event.params["defaultPrompt"] = Value::String(String::new());
+                    }
                     let routed = event.session_id.as_deref().is_some_and(|sid| {
                         let mut routes = private_clone.lock().unwrap_or_else(|e| e.into_inner());
                         match routes.get(sid) {
@@ -500,7 +529,11 @@ impl CdpClient {
             if let Err(error) = ws_tx.send(Message::Text(json)).await {
                 self.pending.lock().await.remove(&id);
                 guard.done = true;
-                return Err(format!("Failed to send CDP command: {}", error));
+                return Err(if crate::private_input::daemon_mode() {
+                    "Private session transport failed".to_string()
+                } else {
+                    format!("Failed to send CDP command: {}", error)
+                });
             }
         }
 
@@ -521,6 +554,9 @@ impl CdpClient {
         };
 
         if let Some(error) = response.error {
+            if crate::private_input::daemon_mode() {
+                return Err("Private session browser operation failed".to_string());
+            }
             return Err(format!("CDP error ({}): {}", method, error));
         }
 
@@ -1102,26 +1138,28 @@ mod tests {
 
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            let mut path_tx = Some(path_tx);
-            let _ = tokio_tungstenite::accept_hdr_async(
-                stream,
-                move |
-                    request: &tokio_tungstenite::tungstenite::handshake::server::Request,
-                    response: tokio_tungstenite::tungstenite::handshake::server::Response,
-                | {
-                    if let Some(tx) = path_tx.take() {
-                        let path = request
-                            .uri()
-                            .path_and_query()
-                            .map(|value| value.as_str().to_string())
-                            .unwrap_or_default();
-                        let _ = tx.send(path);
-                    }
+            use tokio_tungstenite::tungstenite::handshake::server::{
+                Callback, ErrorResponse, Request, Response,
+            };
+            struct CaptureRequestTarget(oneshot::Sender<String>);
+            impl Callback for CaptureRequestTarget {
+                fn on_request(
+                    self,
+                    request: &Request,
+                    response: Response,
+                ) -> Result<Response, ErrorResponse> {
+                    let path = request
+                        .uri()
+                        .path_and_query()
+                        .map(|value| value.as_str().to_string())
+                        .unwrap_or_default();
+                    let _ = self.0.send(path);
                     Ok(response)
-                },
-            )
-            .await
-            .unwrap();
+                }
+            }
+            let _ = tokio_tungstenite::accept_hdr_async(stream, CaptureRequestTarget(path_tx))
+                .await
+                .unwrap();
         });
 
         let url = format!("ws://127.0.0.1:{}?token=a%2Fb&scope=browser%20test", port);

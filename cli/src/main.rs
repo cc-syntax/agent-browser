@@ -10,6 +10,7 @@ mod mcp;
 mod native;
 mod output;
 mod plugins;
+mod private_input;
 mod read;
 mod skills;
 #[cfg(test)]
@@ -291,6 +292,10 @@ fn incompatible_launch_mode_error(flags: &Flags) -> Option<&'static str> {
 }
 
 fn should_send_local_launch_config(flags: &Flags, command: &serde_json::Value) -> bool {
+    // Called only after ensure_daemon verifies immutable private startup options.
+    if flags.private_input_session {
+        return false;
+    }
     (flags.headed
         || flags.cli_headed
         || flags.executable_path.is_some()
@@ -1438,6 +1443,30 @@ fn main() {
         env::set_var("AGENT_BROWSER_NAMESPACE", namespace);
     }
     let clean = clean_args(&args);
+    if clean.first().map(String::as_str) == Some("fill")
+        && clean[1..].iter().any(|arg| arg == "--stdin")
+        && (!flags.private_input_session
+            || clean.len() != 3
+            || clean[0] != "fill"
+            || clean[2] != "--stdin")
+    {
+        private_input::exit_error(private_input::REQUIRED, flags.json);
+    }
+    if flags.private_input_session
+        && !args
+            .iter()
+            .any(|a| matches!(a.as_str(), "--help" | "-h" | "--version" | "-V"))
+        && !clean.is_empty()
+    {
+        if let Err(reason) = private_input::validate_command_tokens(&clean) {
+            private_input::exit_error(reason, flags.json);
+        }
+        let privacy = private_input::PrivateInput::new(true);
+        let parsed = parse_command(&clean, &flags);
+        if !parsed.as_ref().is_ok_and(|cmd| privacy.guard(cmd).is_ok()) {
+            private_input::exit_error(private_input::REFUSED, flags.json);
+        }
+    }
     tls::configure_process(&flags);
 
     let has_help = args.iter().any(|a| a == "--help" || a == "-h");
@@ -1625,6 +1654,29 @@ fn main() {
     {
         cmd["argv"] = json!(read_batch_stdin(&flags));
     }
+    if cmd.get("action").and_then(|v| v.as_str()) == Some("batch") {
+        let nested: Vec<Vec<String>> = cmd
+            .get("commands")
+            .and_then(|v| v.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|v| v.as_str())
+                    .map(commands::shell_words_split)
+                    .collect()
+            })
+            .or_else(|| {
+                cmd.get("argv")
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+            })
+            .unwrap_or_default();
+        if nested
+            .iter()
+            .any(|args| private_input::contains_private_args(args))
+        {
+            private_input::exit_error(private_input::REFUSED, flags.json);
+        }
+    }
     match cmd.get("action").and_then(|v| v.as_str()) {
         Some("read") => cmd["tls"] = json!(tls::session_options(&flags, &flags.session)),
         Some("close") => tls::clear_session(&flags.session),
@@ -1811,7 +1863,11 @@ fn main() {
         plugins: Some(plugin_registry_json.as_str()),
     };
 
-    let daemon_result = match ensure_daemon(&flags.session, &daemon_opts) {
+    let daemon_result = match connection::ensure_daemon_with_mode(
+        &flags.session,
+        &daemon_opts,
+        flags.private_input_session,
+    ) {
         Ok(result) => result,
         Err(e) => {
             if flags.json {
@@ -2168,6 +2224,53 @@ fn main() {
 
     let output_opts = OutputOptions::from_flags(&flags);
 
+    if flags.private_input_session {
+        cmd["privateInputSession"] = json!(true);
+        let mut private_connection = match connection::PrivateConnection::verified(&flags.session) {
+            Ok(connection) => connection,
+            Err(_) => {
+                private_input::exit_error(private_input::REQUIRED, flags.json);
+            }
+        };
+        let private_fill =
+            cmd.get("privateInput").and_then(serde_json::Value::as_bool) == Some(true);
+        if private_fill {
+            use std::io::Read as _;
+            let mut value = String::new();
+            if std::io::stdin().read_to_string(&mut value).is_err() {
+                private_input::exit_error(private_input::READ_FAILED, flags.json);
+            }
+            // Exact UTF-8, including trailing CR/LF and an empty value. Never trim.
+            cmd["value"] = json!(value);
+            cmd.as_object_mut().unwrap().remove("stdin");
+        }
+        match private_connection.send(&cmd) {
+            Ok(resp) if !private_fill => {
+                print_response_with_opts(
+                    &resp,
+                    cmd.get("action").and_then(serde_json::Value::as_str),
+                    &output_opts,
+                );
+                if !resp.success {
+                    exit(1);
+                }
+            }
+            Ok(resp) if resp.success => {
+                if flags.json {
+                    println!("{{\"success\":true,\"data\":{{\"filled\":true}}}}");
+                } else {
+                    println!("Private fill completed");
+                }
+            }
+            Ok(resp) if resp.error.as_deref() == Some(private_input::CONFIRMATION) => {
+                private_input::exit_error(private_input::CONFIRMATION, flags.json);
+            }
+            _ => {
+                private_input::exit_error(private_input::FAILED, flags.json);
+            }
+        }
+        return;
+    }
     match send_command_with_respawn(cmd.clone(), &flags.session, &daemon_opts) {
         Ok(mut resp) => {
             if daemon_restarted {
@@ -2211,6 +2314,9 @@ fn send_command_with_respawn(
     session: &str,
     daemon_opts: &DaemonOptions,
 ) -> Result<connection::Response, String> {
+    if cmd.get("privateInput").is_some() || cmd.get("privateInputSession").is_some() {
+        return Err(private_input::REQUIRED.to_string());
+    }
     let first_attempt = send_command(cmd.clone(), session);
     match first_attempt {
         Err(ref e) if daemon_unreachable(e) => match ensure_daemon(session, daemon_opts) {
@@ -2270,6 +2376,12 @@ fn run_batch(
         return;
     }
 
+    if commands
+        .iter()
+        .any(|args| private_input::contains_private_args(args))
+    {
+        private_input::exit_error(private_input::REFUSED, flags.json);
+    }
     let output_opts = OutputOptions::from_flags(flags);
 
     let mut results: Vec<serde_json::Value> = Vec::new();

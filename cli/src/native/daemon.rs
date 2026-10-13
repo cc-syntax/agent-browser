@@ -21,6 +21,11 @@ use super::stream::{IdleActivity, StreamServer};
 use crate::connection::INTERNAL_DAEMON_SHUTDOWN_ACTION;
 
 pub async fn run_daemon(session: &str) {
+    let private = crate::private_input::daemon_mode();
+    if private && crate::private_input::validate_environment().is_err() {
+        let _ = writeln!(std::io::stderr(), "{}", crate::private_input::REFUSED);
+        process::exit(1);
+    }
     let socket_dir = get_daemon_socket_dir();
     if !socket_dir.exists() {
         let _ = fs::create_dir_all(&socket_dir);
@@ -68,6 +73,17 @@ pub async fn run_daemon(session: &str) {
 
     let version_path = socket_dir.join(format!("{}.version", session));
     let _ = fs::write(&version_path, env!("CARGO_PKG_VERSION"));
+    // Nonsecret hint prevents ordinary clients from silently restarting a
+    // private daemon. The live RPC contract, not this file, authorizes stdin.
+    let private_path = socket_dir.join(format!("{}.private-input", session));
+    if private {
+        if fs::write(&private_path, b"1").is_err() {
+            let _ = writeln!(std::io::stderr(), "{}", crate::private_input::REFUSED);
+            process::exit(1);
+        }
+    } else {
+        let _ = fs::remove_file(&private_path);
+    }
 
     // On Unix the daemon listens on a Unix domain socket; on Windows it uses
     // TCP, so there is no .sock file — only a .port file written by the server.
@@ -104,26 +120,27 @@ pub async fn run_daemon(session: &str) {
         .ok()
         .and_then(|s| s.parse::<u16>().ok())
         .unwrap_or(0);
-    match StreamServer::start_without_client(
-        preferred_port,
-        session.to_string(),
-        true,
-        idle_activity.clone(),
-    )
-    .await
-    {
-        Ok((stream_server, client_slot)) => {
-            stream_client = Some(client_slot.clone());
-            if let Err(e) = fs::write(&stream_path, stream_server.port().to_string()) {
-                let _ = writeln!(std::io::stderr(), "Failed to write .stream file: {}", e);
+    if !private {
+        match StreamServer::start_without_client(
+            preferred_port,
+            session.to_string(),
+            true,
+            idle_activity.clone(),
+        )
+        .await
+        {
+            Ok((stream_server, client_slot)) => {
+                stream_client = Some(client_slot.clone());
+                if let Err(e) = fs::write(&stream_path, stream_server.port().to_string()) {
+                    let _ = writeln!(std::io::stderr(), "Failed to write .stream file: {}", e);
+                }
+                stream_server_instance = Some(Arc::new(stream_server));
             }
-            stream_server_instance = Some(Arc::new(stream_server));
-        }
-        Err(e) => {
-            let _ = writeln!(std::io::stderr(), "Stream server failed to start: {}", e);
+            Err(e) => {
+                let _ = writeln!(std::io::stderr(), "Stream server failed to start: {}", e);
+            }
         }
     }
-
     // Auto-shutdown the daemon after this many ms of inactivity (no commands
     // or dashboard input received). Applies a default when
     // AGENT_BROWSER_IDLE_TIMEOUT_MS is unset; an explicit 0 disables idle
@@ -153,6 +170,7 @@ pub async fn run_daemon(session: &str) {
     }
     let _ = fs::remove_file(&pid_path);
     let _ = fs::remove_file(&version_path);
+    let _ = fs::remove_file(&private_path);
     let _ = fs::remove_file(&stream_path);
     let _ = fs::remove_file(socket_dir.join(format!("{}.engine", session)));
     let _ = fs::remove_file(socket_dir.join(format!("{}.provider", session)));
@@ -564,7 +582,7 @@ async fn handle_connection<S>(
                     Err(e) => {
                         let err = serde_json::json!({
                             "success": false,
-                            "error": format!("Invalid JSON: {}", e),
+                            "error": if crate::private_input::daemon_mode() { crate::private_input::REFUSED.to_string() } else { format!("Invalid JSON: {}", e) },
                         });
                         let mut resp = serde_json::to_string(&err).unwrap_or_default();
                         resp.push('\n');

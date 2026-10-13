@@ -456,6 +456,17 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
             Ok(json!({ "id": id, "action": "dblclick", "selector": sel }))
         }
         "fill" => {
+            if rest.contains(&"--stdin") {
+                if rest.len() != 2 || rest[1] != "--stdin" || !flags.private_input_session {
+                    return Err(ParseError::InvalidValue {
+                        message: crate::private_input::REQUIRED.to_string(),
+                        usage: "fill <selector> --stdin",
+                    });
+                }
+                return Ok(
+                    json!({ "id": id, "action": "fill", "selector": rest[0], "stdin": true, "privateInput": true }),
+                );
+            }
             let sel = rest.first().ok_or_else(|| ParseError::MissingArguments {
                 context: "fill".to_string(),
                 usage: "fill <selector> <text>",
@@ -3579,6 +3590,7 @@ mod tests {
 
     fn default_flags() -> Flags {
         Flags {
+            private_input_session: false,
             session: "test".to_string(),
             json: false,
             headed: false,
